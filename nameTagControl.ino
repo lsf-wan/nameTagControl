@@ -37,6 +37,7 @@ int cropHeight = 300;
 
 int control_id;
 int grbl_id = -1;
+bool grblStatus = false;
 String grblIp;
 String grblHttp;
 
@@ -63,7 +64,7 @@ void startCamera() {
     config.pin_xclk = XCLK_GPIO_NUM;
     config.xclk_freq_hz = 20000000;
     config.pixel_format = PIXFORMAT_JPEG;
-    config.frame_size = FRAMESIZE_XGA;
+    config.frame_size = FRAMESIZE_SVGA;
     config.jpeg_quality = 10;
     config.fb_count = 1;
 
@@ -101,6 +102,19 @@ void handleRoot() {
     <style>
         body { text-align: center; font-family: Arial, sans-serif; }
         #cameraFeed { display: block; margin: auto; }
+    .status-indicator {
+        width: 15px;
+        height: 15px;
+        border-radius: 50%;
+        display: inline-block;
+        background-color: gray; /* default/offline */
+    }
+    .online {
+        background-color: green;
+    }
+    .offline {
+      background-color: red;
+    }
     </style>
     <script>
         let lightOn = false;
@@ -112,7 +126,24 @@ void handleRoot() {
                 document.getElementById('cameraFeed').src = '/capture?' + new Date().getTime();
             }
         }
-        setInterval(refreshImage, 500);  // Refresh image every 1/2 second
+        setInterval(refreshImage, 1000);  // Refresh image every 1/2 second
+        function updateStatus() {
+          fetch('/grblStatus')
+            .then(response => response.json())
+            .then(data => {
+              const statusCircle = document.getElementById('statusCircle');
+              statusCircle.className = 'status-indicator ' + (data.online ? 'online' : 'offline');
+            })
+            .catch(error => {
+              console.error('Status check failed:', error);
+              document.getElementById('statusCircle').className = 'status-indicator offline';
+            });
+        }
+        // Call once immediately
+        updateStatus();
+
+        // Then repeat every 10 seconds
+        setInterval(updateStatus, 10000);
 
         function toggleCapture() {
             captureOn = !captureOn;
@@ -201,9 +232,10 @@ void handleRoot() {
         };
     </script>
 </head>
+
 <body>
     <h1>Nametag Storage Controllor</h1>
-    <h2>Grbl IP: )rawliteral" + grblIp + R"rawliteral(</h2>
+    <h2>Grbl IP: )rawliteral" + grblIp + R"rawliteral( - Status: <span id="statusCircle" class="status-indicator"></span></h2>
     <br><br>
     <img id='cameraFeed' src='/capture' width='480' height='300' alt='Camera Feed'>
     <br><br>
@@ -241,6 +273,7 @@ bool sendRequest(String &url, String &response, int maxTry = 3) {
         http.end();  // Free resources
         return true;
       }
+      Serial.printf("sendRequest failed. Error: %s\n", http.errorToString(httpCode).c_str());
       http.end();  // Free resources
       delay(500);
     }
@@ -257,6 +290,7 @@ bool sendRequest(String &url, JsonDocument &doc, int maxTry = 3) {
     DeserializationError error = deserializeJson(doc, response);
     if (!error)
       return true;
+    Serial.println("deserializeJson failed: " + response);
   }
   return false;
 }
@@ -373,6 +407,8 @@ bool getUidFromQR(int &uid, String &msg) {
 }
 
 bool moveArm(int steps) {
+  if (!grblStatus)
+    return false;
   String response;
   String url = grblHttp + "/send?cmd=G90G0Y" + String(steps);
   if (!sendRequest(url, response)) {
@@ -384,6 +420,8 @@ bool moveArm(int steps) {
 }
 
 bool moveWheel(int pos) {
+  if (!grblStatus)
+    return false;
   String response;
   String url = grblHttp + "/send?cmd=Move:" + String(pos);
   if (!sendRequest(url, response)) {
@@ -407,6 +445,8 @@ bool clamp(bool on) {
 }
 
 bool wait4Idle() {
+  if (!grblStatus)
+    return false;
   String response;
   String url = grblHttp + "/wait?msec=1000";
   //Serial.printf("wait4Idle: %s\n", url.c_str());
@@ -533,6 +573,8 @@ bool processMapping() {
 void handleProcessQR() {
     Serial.println("handleProcessQR()");
     moveArm(Y_SCAN);
+    wait4Idle();
+    delay(500);
     int uid;
     String msg;
     if (!getUidFromQR(uid, msg)) {
@@ -620,10 +662,32 @@ void handleHomePos() {
     else
       server.send(500, "text/plain", "Failed to go to Home position");
 }
+void handleGrblStatus() {
+  String json = "{\"online\":";
+  json += (grblStatus ? "true" : "false");
+  json += "}";
+  server.send(200, "application/json", json);
+}
 void sendProgress() {
     String message = "Progress: " + String(mapIndex) + "/" + String(totSlot);
     Serial.println(message);
     webSocket.broadcastTXT(message);  // Send update to all connected clients
+}
+
+unsigned long lastHeartbeat = 0;
+const unsigned long heartbeatInterval = 10000;  // 10 seconds
+
+void sendHeartbeat() {
+  StaticJsonDocument<32> doc;
+  String url = data_server + controlProcess + "?action=heartbeat&control_id=" + control_id;
+  if (!sendRequest(url, doc))
+    return;
+  if (doc["success"].as<int>() == 1) {
+    grblStatus = doc["grblStatus"].as<int>();
+    Serial.printf("Heartbeat sent. got grbl: %d in response\n", grblStatus);
+  } else {
+    Serial.println("Failed to send heartbeat: " + url);
+  }
 }
 
 void setup() {
@@ -690,6 +754,7 @@ void setup() {
     server.on("/lighton", HTTP_GET, handleLightOn);
     server.on("/lightoff", HTTP_GET, handleLightOff);
     server.on("/homePos", HTTP_GET, handleHomePos);
+    server.on("/grblStatus", HTTP_GET, handleGrblStatus);
     server.onNotFound([]() {
       Serial.printf("Unhandled request: %s\n", server.uri().c_str());
       server.send(404, "text/plain", "Not Found");
@@ -700,6 +765,7 @@ void setup() {
 
     Serial.println("HTTP server started");
     registerController();
+    sendHeartbeat();
 }
 
 void loop() {
@@ -713,4 +779,9 @@ void loop() {
       webSocket.broadcastTXT("");
     } 
     webSocket.loop();
+    unsigned long now = millis();
+    if (now - lastHeartbeat >= heartbeatInterval) {
+      lastHeartbeat = now;
+      sendHeartbeat();
+    }
 }
