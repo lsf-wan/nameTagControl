@@ -1,6 +1,7 @@
 // Camera configuration
 #define CAMERA_MODEL_AI_THINKER
 
+#include "mbedtls/base64.h"
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WebSocketsServer.h>
@@ -14,8 +15,8 @@
 #define BIG_SEND
 
 #define LED_GPIO 4  // ESP32-CAM built-in flash LED
-const int Y_GRAP = 17;
-const int Y_SCAN = 9;
+const int Y_GRAP = 14;
+const int Y_SCAN = 7;
 const int Y_BEGIN = 0;
 
 // Replace with your network credentials
@@ -32,6 +33,8 @@ String grblProcess = "/GrblConfig.php";
 WebServer server(80);
 WebSocketsServer webSocket(81);  // WebSocket server on port 81
 WiFiClient grblClient;
+WiFiServer telnetServer(23);
+WiFiClient telnetClient;
 
 int cropWidth = 480;
 int cropHeight = 300;
@@ -42,6 +45,59 @@ bool grblStatus = false;
 String grblIp;
 const uint16_t grbl_port = 23;
 String grblHttp;
+
+class TelnetStream : public Stream {
+  public:
+    void begin(unsigned long baud = 115200) {}
+    size_t write(uint8_t c) override {
+      if (telnetClient && telnetClient.connected()) {
+        return telnetClient.write(c);
+      }
+      return Serial.write(c);
+    }
+
+    size_t write(const uint8_t *buffer, size_t size) override {
+      if (telnetClient && telnetClient.connected()) {
+        return telnetClient.write(buffer, size);
+      }
+      return Serial.write(buffer, size);
+    }
+
+    int available() override {
+      if (telnetClient && telnetClient.connected()) {
+        return telnetClient.available();
+      }
+      return Serial.available();
+    }
+
+    int read() override {
+      if (telnetClient && telnetClient.connected()) {
+        return telnetClient.read();
+      }
+      return Serial.read();
+    }
+
+    int peek() override {
+      if (telnetClient && telnetClient.connected()) {
+        return telnetClient.peek();
+      }
+      return Serial.peek();
+    }
+
+    void flush() override {
+      if (telnetClient && telnetClient.connected()) {
+        telnetClient.flush();
+      } else {
+        Serial.flush();
+      }
+    }
+};
+
+// Create global instance
+TelnetStream TelnetSerial;
+
+// Optionally redirect Serial to TelnetSerial
+#define Serial TelnetSerial
 
 void startCamera() {
     camera_config_t config;
@@ -204,7 +260,9 @@ void handleRoot() {
             });
         }
 
-        function processOCR() {
+        function processQR() {
+            const btn = document.getElementById('qrBtn');
+            btn.disabled = true;
             document.getElementById('MsgResult').innerText = 'Processing...';
             fetch('/processQR')
             .then(response => response.text())
@@ -213,6 +271,9 @@ void handleRoot() {
             })
             .catch(error => {
                 document.getElementById('MsgResult').innerText = 'Error: ' + error;
+            })
+            .finally(() => {
+                btn.disabled = false;
             });
         }
         function homePos() {
@@ -254,10 +315,23 @@ void handleRoot() {
                 document.getElementById('MsgResult').innerText = 'Error: ' + error;
               });
         }
+        let base64Image = "";
+        let receiving = false;
         const ws = new WebSocket(`ws://${window.location.hostname}:81/`);
         ws.onmessage = (event) => {
-            document.getElementById("MsgResult").innerText = event.data;
-            console.log(event.data);  // Log progress updates
+            const data = event.data;
+            if (data === "IMG_START") {
+              base64Image = "";
+              receiving = true;
+            } else if (data === "IMG_END") {
+              receiving = false;
+              console.log("Image size=" + base64Image.length);        
+              document.getElementById("cameraFeed").src = "data:image/jpeg;base64," + base64Image;
+            } else if (receiving) {
+              base64Image += data;
+            } else {
+              document.getElementById("MsgResult").innerText = data;
+            }
         };
         ws.onerror = (error) => {
             console.error("WebSocket Error:", error);
@@ -276,7 +350,7 @@ void handleRoot() {
     <br><br>
     <button id='captureBtn' onclick='toggleCapture()'>Stop Capture</button>
     <button id='lightBtn' onclick='toggleLight()'>Turn Light On</button>
-    <button onclick='processOCR()'>Get QR Code</button>
+    <button id="qrBtn" onclick="processQR()">Get QR Code</button>
     <button id="mapBtn" onclick="toggleMap()">Setup Map</button>
     <button onclick='homePos()'>Go Home</button>
     <button onclick='initGrbl()'>Init Grbl</button>
@@ -352,7 +426,7 @@ bool wait4Idle(int msec = 1000) {
         Serial.println("Alarm: send $X to unlock");
         return sendCmd("$X");
       }
-      delay(500);
+      delay(100);
     }
     if (getState() == "Idle")
       return true;
@@ -365,7 +439,7 @@ bool getResp(String &line, int timeout = 0, int wait4IdleMs = 0) {
   if (timeout > 0) {
     unsigned long now = millis();
     while (millis() - now < timeout && !grblClient.available()) {
-      delay(100);
+      delay(10);
     }
   }
 
@@ -381,8 +455,8 @@ bool getResp(String &line, int timeout = 0, int wait4IdleMs = 0) {
       rv = true;
     }
   }
-  if (rv)
-    Serial.println("getResp: wait4Idle=" + String(wait4IdleMs) + ", " + lines);
+  //if (rv)
+    //Serial.println("getResp: wait4Idle=" + String(wait4IdleMs) + ", " + lines);
   if (alarm)
     return sendCmd("$X");
   // wait for idle state
@@ -421,7 +495,7 @@ String getState() {
     String line;
     while (getResp(line, 0, 0));
     String cmd = "?";
-    Serial.println("getState: sending " + cmd);
+    //Serial.println("getState: sending " + cmd);
     grblClient.println(cmd);
 
     unsigned long now = millis();
@@ -438,7 +512,7 @@ String getState() {
         int end = line.indexOf('|');
         if (end > 1) {
           state = line.substring(1, end);
-          Serial.println ("state=" + state);
+          //Serial.println ("state=" + state);
         }
       }
     }
@@ -466,6 +540,7 @@ void registerController() {
 }
 
 void handleCapture() {
+    static int errorCnt = 0;
     //Serial.println("Starting image capture...");
     WiFiClient client = server.client();
     if (!client) {
@@ -474,10 +549,19 @@ void handleCapture() {
     }
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
-        Serial.println("Camera capture failed.");
-        server.send(500, "text/plain", "Camera capture failed.");
+        char msg[80];
+        sprintf(msg, "Camera capture failed (%d).", ++errorCnt);
+        Serial.println(msg);
+        server.send(500, "text/plain", msg);
+        if (errorCnt > 2) {
+          Serial.println("restart to fix camera issue");
+          delay(100);
+          ESP.restart();
+        }
         return;
     }
+    if (errorCnt)
+      errorCnt = 0;
     Serial.printf("Image captured successfully. width=%d height=%d, Size: %d bytes.\n", fb->width, fb->height, fb->len);
     if (client.connected()) {
         // Send headers manually
@@ -519,15 +603,37 @@ void handleCapture() {
     esp_camera_fb_return(fb);
 }
 
+void sendImageOverWebSocket(camera_fb_t *fb) {
+  const size_t chunkSize = 3 * 400;
+  unsigned char encoded[4 * 400 + 1];
+
+  webSocket.broadcastTXT("IMG_START");
+
+  for (size_t i = 0; i < fb->len; i += chunkSize) {
+      size_t len = min(chunkSize, fb->len - i);
+      size_t outLen;
+      int res = mbedtls_base64_encode(encoded, sizeof(encoded), &outLen, fb->buf + i, len);
+      if (res == 0) {
+          encoded[outLen] = '\0';
+          webSocket.broadcastTXT((char *)encoded);
+      } else {
+          Serial.printf("Base64 encode failed: %d\n", res);
+          break;
+      }
+  }
+  webSocket.broadcastTXT("IMG_END");
+}
+
 // send to server to do OCR
 bool getUidFromQR(int &uid, String &msg) {
-    Serial.println("getUidFromQR()");
+    delay(700);
+    //Serial.println("getUidFromQR()");
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
         msg = "Camera capture failed";
         return false;
     }
-    esp_camera_fb_return(fb);
+    sendImageOverWebSocket(fb);
 
     // send the image to server to decode the qrcode
     HTTPClient http;
@@ -537,8 +643,9 @@ bool getUidFromQR(int &uid, String &msg) {
     http.addHeader("Content-Type", "image/jpg");
     int httpResponseCode = http.POST(fb->buf, fb->len);
     String response = http.getString();
-    Serial.printf("getUidFromQR: length=%d, response=%s\n", fb->len, response.c_str());
+    //Serial.printf("getUidFromQR: length=%d, response=%s\n", fb->len, response.c_str());
     http.end();
+    esp_camera_fb_return(fb);
     // retrieve the uid
     String paramName = "uid";
     if (httpResponseCode == 200) {
@@ -551,6 +658,7 @@ bool getUidFromQR(int &uid, String &msg) {
         endIndex = response.length(); // No more parameters, take rest of the string
       uid = response.substring(startIndex, endIndex).toInt();
       msg = "Success";
+      Serial.printf("getUidFromQR: uid=%d\n", uid);
       return true;
     }
     msg = "No QRCode or decode failure";
@@ -635,7 +743,7 @@ bool processMapping() {
     case 3:
       // clamp the nametag
       rv = clamp(true);
-      delay(300);
+      delay(200);
       break;
     case 4:
       // move Y axis to scan position
@@ -644,13 +752,10 @@ bool processMapping() {
     case 5:
       // wait until all queued command done before scan QR
       rv = wait4Idle();
-      //if (rv)
-        //delay(1000);
       break;
     case 6:
       // scan QRCode
       {
-      delay(700);
       String msg;
       int cnt = 0;
       while (!getUidFromQR(uid, msg)) {
@@ -658,7 +763,6 @@ bool processMapping() {
           break;
         Serial.println(msg);
         yield(); // Allow WiFi and HTTP handling
-        delay(200);
       }
       // set the map
       if (uid != -1) {
@@ -674,7 +778,7 @@ bool processMapping() {
     case 7:
       // move Y axis to finish position
       rv = moveArm(Y_GRAP);
-      delay(300);
+      delay(200);
       break;
     case 8:
       // release the nametag
@@ -702,11 +806,11 @@ bool processMapping() {
 
 void handleProcessQR() {
     Serial.println("handleProcessQR()");
-    bool rv = moveArm(Y_GRAP) &&
-      clamp(true) &&
-      moveArm(Y_SCAN) &&
-      wait4Idle(2000);
-    delay(500);
+    moveArm(Y_GRAP);
+    clamp(true);
+    delay(200);
+    moveArm(Y_SCAN);
+    wait4Idle(2000);
     int uid;
     String msg;
     if (!getUidFromQR(uid, msg)) {
@@ -816,15 +920,15 @@ void handleGrblStatus() {
 }
 void handleGrblInit() {
   if (initGrbl())
-  server.send(200, "text/plain", "GRBL is initialized");
-else
-  server.send(500, "text/plain", "Failed to go to initial Grbl");
+    server.send(200, "text/plain", "GRBL is initialized");
+  else
+    server.send(500, "text/plain", "Failed to go to initial Grbl");
 }
 void sendProgress(int uid, int duration) {
-    int elaps = (millis() - mapStartTime) / 1000;
-    String message = "Progress: " + String(mapIndex+1) + "/" + String(totSlot) + ", ID " + String(uid) + ", duration " + String(duration/1000.0) + " sec (" + String(elaps / 60) + ":" + String(elaps%60) + ")";
-    Serial.println(message);
-    webSocket.broadcastTXT(message);  // Send update to all connected clients
+  int elaps = (millis() - mapStartTime) / 1000;
+  String message = "Progress: " + String(mapIndex+1) + "/" + String(totSlot) + ", ID " + String(uid) + ", duration " + String(duration/1000.0) + " sec (" + String(elaps / 60) + ":" + String(elaps%60) + ")";
+  Serial.println(message);
+  webSocket.broadcastTXT(message);  // Send update to all connected clients
 }
 
 void handlePosition() {
@@ -914,7 +1018,9 @@ void setup() {
 
     // Start the camera
     startCamera();
-
+    // start Telnet server
+    telnetServer.begin();
+    telnetServer.setNoDelay(true);
     // Setup web server routes
     server.on("/", HTTP_GET, handleRoot);
     server.on("/capture", HTTP_GET, handleCapture);
@@ -943,6 +1049,19 @@ void setup() {
 }
 
 void loop() {
+    if (telnetServer.hasClient()) {
+      if (telnetClient && telnetClient.connected()) {
+        Serial.println("Drop this session and connect to new client");
+        Serial.flush();
+        telnetClient.stop(); // Kick old client
+      }
+      telnetClient = telnetServer.available();
+      Serial.println("New Telnet client connected");
+    }
+    if (Serial.available()) {
+      char c = Serial.read();
+      Serial.print(c);
+    }
     ArduinoOTA.handle();
     server.handleClient();
     if (isMapping && !stopMapping) {
