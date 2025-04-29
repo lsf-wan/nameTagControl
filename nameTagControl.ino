@@ -817,7 +817,12 @@ bool initMapProcess() {
       Serial.printf("%s failed\n", url.c_str());
       return false;
     }
-    totSlot = doc["pos"].as<int>();
+    totSlot = doc["xpos"].as<int>();
+    Y_BEGIN = doc["y0"].as<int>();
+    Y_SCAN = doc["y1"].as<int>();
+    Y_GRAP = doc["y2"].as<int>();
+
+    Serial.printf("%s, xpos=%d y0=%d y1=%d y2=%d\n", url.c_str(), totSlot, Y_BEGIN, Y_SCAN, Y_GRAP);
     // clean up the map
     url = data_server + controlProcess + "?action=cleanup&control_id=" + control_id;
     if (!sendRequest(url,  doc)) {
