@@ -15,9 +15,9 @@
 #define BIG_SEND
 
 #define LED_GPIO 4  // ESP32-CAM built-in flash LED
-const int Y_GRAP = 14;
-const int Y_SCAN = 7;
-const int Y_BEGIN = 0;
+int Y_GRAP = 14;
+int Y_SCAN = 7;
+int Y_BEGIN = 0;
 
 // Replace with your network credentials
 const char* ssid = "wanhome";
@@ -45,6 +45,8 @@ bool grblStatus = false;
 String grblIp;
 const uint16_t grbl_port = 23;
 String grblHttp;
+String buttonInfo;
+bool needButtonInfo = false;
 
 class TelnetStream : public Stream {
   public:
@@ -150,6 +152,30 @@ void startCamera() {
         Serial.println("failed to get the sensor");
 }
 void handleRoot() {
+    String buttonValues;
+    // buttons set to default
+    if (buttonInfo == "") {
+      buttonValues = "\n\
+        let captureOn = true;\n\
+        let lightOn = false;\n\
+        let qrcodeOn = false;\n\
+        let isMapping = false;\n\
+        let posOn = false;";
+    } else {
+        StaticJsonDocument<200> doc; // Adjust size based on your JSON complexity
+        DeserializationError error = deserializeJson(doc, buttonInfo);
+        if (error) {
+            Serial.print("deserializeJson() failed: ");
+            Serial.println(error.c_str());
+            return;
+        }
+        buttonValues = "\
+          let captureOn = " + doc["capture"].as<String>() + ";\n\
+          let lightOn = " + doc["light"].as<String>() + ";\n\
+          let qrcodeOn = " + doc["qrcode"].as<String>() + ";\n\
+          let isMapping = " + doc["map"].as<String>() + ";\n\
+          let posOn = " + doc["pos"].as<String>() + ";";
+    }
     String html = R"rawliteral(
 <!DOCTYPE html>
 <html lang='en'>
@@ -176,10 +202,7 @@ void handleRoot() {
     </style>
     <script>
         let curPos = -1;
-        let lightOn = false;
-        let captureOn = true;
-        let isMapping = false;
-
+)rawliteral" + buttonValues + R"rawliteral(
         function refreshImage() {
             if (captureOn) {
                 document.getElementById('cameraFeed').src = '/capture?' + new Date().getTime();
@@ -206,12 +229,10 @@ void handleRoot() {
 
         function toggleCapture() {
             captureOn = !captureOn;
-            let btn = document.getElementById('captureBtn');
-            btn.innerText = captureOn ? 'Stop Capture' : 'Start Capture';
+            updButton();
         }
 
         function toggleMap() {
-          const mapBtn = document.getElementById('mapBtn');
           const msgDisplay = document.getElementById('MsgResult');
 
           if (!isMapping) {
@@ -219,7 +240,6 @@ void handleRoot() {
             if (captureOn)
               toggleCapture();
             isMapping = true;
-            mapBtn.innerText = "Stop Mapping";
             msgDisplay.innerText = "Starting Setup Map...";
 
             fetch('/setNametagMap')
@@ -230,7 +250,6 @@ void handleRoot() {
           } else {
             console.log("toggleMap(): isMapping is true, going to stop");
             isMapping = false;
-            mapBtn.innerText = "Setup Map";
             // Stop mapping
             fetch('/stopMap')
               .then(response => response.text())
@@ -239,44 +258,45 @@ void handleRoot() {
               })
               .catch(error => {
                 document.getElementById('MsgResult').innerText = 'Error: ' + error;
-              // Clear the error message after 5 seconds
-              setTimeout(() => {
-                location.reload();
-              }, 5000);
-            });
+                // Clear the error message after 5 seconds
+                setTimeout(() => {
+                  location.reload();
+                }, 5000);
+              });
           }
+          updButton();
         }
 
         function toggleLight() {
             lightOn = !lightOn;
             let url = lightOn ? '/lighton' : '/lightoff';
             fetch(url)
-            .then(response => response.text())
-            .then(data => {
-                document.getElementById('lightBtn').innerText = lightOn ? 'Turn Light Off' : 'Turn Light On';
-            })
-            .catch(error => {
-                document.getElementById('MsgResult').innerText = 'Error: ' + error;
-            });
+              .catch(error => {
+                  document.getElementById('MsgResult').innerText = 'Error: ' + error;
+              });
+            updButton();
         }
 
         function processQR() {
-            const btn = document.getElementById('qrBtn');
-            btn.disabled = true;
+            qrcodeOn = true;
+            updButton();
             document.getElementById('MsgResult').innerText = 'Processing...';
             fetch('/processQR')
-            .then(response => response.text())
-            .then(qrCode => {
-                document.getElementById('MsgResult').innerText = 'UID: ' + qrCode;
-            })
-            .catch(error => {
-                document.getElementById('MsgResult').innerText = 'Error: ' + error;
-            })
-            .finally(() => {
-                btn.disabled = false;
-            });
+              .then(response => response.text())
+              .then(qrCode => {
+                  document.getElementById('MsgResult').innerText = 'UID: ' + qrCode;
+              })
+              .catch(error => {
+                  document.getElementById('MsgResult').innerText = 'Error: ' + error;
+              })
+              .finally(() => {
+                  qrcodeOn = false;
+                  updButton();
+              });
         }
         function homePos() {
+            const btn = document.getElementById('homeBtn');
+            btn.disabled = true;
             document.getElementById('MsgResult').innerText = 'Going Home...';
             fetch('/homePos')
               .then(response => response.text())
@@ -285,6 +305,9 @@ void handleRoot() {
               })
               .catch(error => {
                 document.getElementById('MsgResult').innerText = 'Error: ' + error;
+              })
+              .finally(() => {
+                  btn.disabled = false;
               });
             curPos = -1;
         }
@@ -300,6 +323,8 @@ void handleRoot() {
               });
         }
         function position(delta) {
+            posOn = true;
+            updButton();
             curPos += delta;
             if (curPos < 0)
               curPos = 0;
@@ -313,8 +338,57 @@ void handleRoot() {
               })
               .catch(error => {
                 document.getElementById('MsgResult').innerText = 'Error: ' + error;
+              })
+              .finally(() => {
+                posOn = false;
+                updButton();
               });
         }
+        function updButton() {
+            const data = {
+              capture: captureOn,
+              light: lightOn,
+              qrcode: qrcodeOn,
+              map: isMapping,
+              pos: posOn,
+            };
+
+            fetch('/updButton', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify(data)
+            })
+              .catch(err => console.error("updButton Request failed:", err));
+        }
+        function register() {
+            console.log("register");
+            let url = '/register';
+            fetch(url)
+              .catch(error => {
+                  document.getElementById('MsgResult').innerText = 'Error: ' + error;
+              })
+              .finally(() => {
+                  location.reload();
+              });
+        }
+        function initButtons() {
+            console.log("initButtons: capture=" + 
+              captureOn + ", light=" +
+              lightOn + ", qrCode=" +
+              qrcodeOn + ", map=" +
+              isMapping + ", pos=" +
+              posOn
+            );        
+            document.getElementById('captureBtn').innerText = captureOn ? 'Stop Capture' : 'Start Capture';
+            document.getElementById('lightBtn').innerText = lightOn ? 'Turn Light Off' : 'Turn Light On';
+            document.getElementById('qrBtn').disabled = qrcodeOn == 1;
+            document.getElementById('mapBtn').innerText = isMapping ? "Stop Mapping" : "Setup Map";
+            document.getElementById('fwPos').disabled = posOn == 1;
+            document.getElementById('bwPos').disabled = posOn == 1;
+        }
+
         let base64Image = "";
         let receiving = false;
         const ws = new WebSocket(`ws://${window.location.hostname}:81/`);
@@ -330,7 +404,37 @@ void handleRoot() {
             } else if (receiving) {
               base64Image += data;
             } else {
-              document.getElementById("MsgResult").innerText = data;
+              console.log("WebSocket received: " + data);        
+              // try parse as json string
+              try {
+                  const buttons = JSON.parse(data);
+                  for (let key in buttons) {
+                      if (buttons.hasOwnProperty(key)) {
+                          switch(key) {
+                            case "capture":
+                              captureOn = buttons[key];
+                              break;
+                            case "light":
+                              lightOn = buttons[key];
+                              break;
+                            case "qrcode":
+                              qrcodeOn = buttons[key];
+                              break;
+                            case "map":
+                              isMapping = buttons[key];
+                              break;
+                            case "pos":
+                              posOn = buttons[key];
+                              break;
+                            default:
+                              console.log(`Unhandled button: ${key}, Value: ${buttons[key]}`);
+                          }
+                      }
+                  }
+                  initButtons();
+              } catch (e) {
+                  document.getElementById("MsgResult").innerText = data;
+              }
             }
         };
         ws.onerror = (error) => {
@@ -352,17 +456,26 @@ void handleRoot() {
     <button id='lightBtn' onclick='toggleLight()'>Turn Light On</button>
     <button id="qrBtn" onclick="processQR()">Get QR Code</button>
     <button id="mapBtn" onclick="toggleMap()">Setup Map</button>
-    <button onclick='homePos()'>Go Home</button>
-    <button onclick='initGrbl()'>Init Grbl</button>
-    <button onclick='position(1)'>NameTag Pos (fw)</button>
-    <button onclick='position(-1)'>NameTag Pos (bw)</button>
+    <button id="homeBtn" onclick='homePos()'>Go Home</button>
+    <button id="initBtn" onclick='initGrbl()'>Init Grbl</button>
+    <button id="regBtn" onclick='register()'>Register</button>
+    <button id="fwPos" onclick='position(1)'>NameTag Pos (fw)</button>
+    <button id="bwPos" onclick='position(-1)'>NameTag Pos (bw)</button>
     <p id='MsgResult'></p>
 </body>
+    <script>
+        initButtons();
+    </script>
 </html>
 )rawliteral";
 
     server.send(200, "text/html", html);
-    digitalWrite(LED_GPIO, LOW); // Turn LED OFF
+    if (buttonInfo == "") {
+      digitalWrite(LED_GPIO, LOW); // Turn LED OFF
+    } else {
+      needButtonInfo = true;
+      Serial.println("needButtonInfo set to true");
+    }
 }
 
 bool sendRequest(String &url, String &response, int maxTry = 3) {
@@ -524,7 +637,8 @@ void registerController() {
   String macAddress = WiFi.macAddress();
   String ipAddress = WiFi.localIP().toString();
   StaticJsonDocument<32> doc;
-  String url = data_server + controlProcess + "?action=config&mac=" + macAddress + "&ip=" + ipAddress;
+  String url = data_server + controlProcess + "?action=register&mac=" + macAddress + "&ip=" + ipAddress;
+  Serial.println(url);
   if (!sendRequest(url, doc))
     return;
   if (doc["success"].as<int>() == 1) {
@@ -532,8 +646,11 @@ void registerController() {
     grblIp = doc["grbl_ip"].as<String>();
     grbl_id = doc["grbl_id"].as<int>();
     grblHttp = "http://" + grblIp;
-
-    Serial.printf("registerController(): id=%d grblId=%d grblIp=%s\n", control_id, grbl_id, grblIp.c_str());
+    Y_BEGIN = doc["y0"].as<int>();
+    Y_SCAN = doc["y1"].as<int>();
+    Y_GRAP = doc["y2"].as<int>();
+    
+    Serial.printf("registerController(): id=%d, grblId=%d, grblIp=%s, Y_BEGIN=%d, Y_SCAN=%d, Y_GRAP=%d\n", control_id, grbl_id, grblIp.c_str(), Y_BEGIN, Y_SCAN, Y_GRAP);
   } else {
     Serial.println(doc["msg"].as<String>());
   }
@@ -863,8 +980,10 @@ bool getNametag(int pos) {
 bool initGrbl() {
   if (getState() == "Alarm")
     sendCmd("$X");
-  sendCmd("M5");
   sendCmd("$H", 10000);
+  moveArm(Y_BEGIN);
+  moveWheel(0);
+  clamp(false);
   grblClient.stop();
   return true;
 }
@@ -951,6 +1070,20 @@ void handlePosition() {
   }
 }
 
+void handleButton() {
+  if (server.hasArg("plain")) {
+    buttonInfo = server.arg("plain");
+    Serial.println("handleButton:broadcast: " + buttonInfo);
+    webSocket.broadcastTXT(buttonInfo);  // Send update to all connected clients (includes ourself)
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleRegister() {
+  registerController();
+  server.send(200, "text/plain", "OK");
+}
+
 unsigned long lastHeartbeat = 0;
 const unsigned long heartbeatInterval = 60000;  // 60 seconds
 
@@ -1034,6 +1167,8 @@ void setup() {
     server.on("/grblStatus", HTTP_GET, handleGrblStatus);
     server.on("/grblInit", HTTP_GET, handleGrblInit);
     server.on("/position", HTTP_GET, handlePosition);
+    server.on("/updButton", HTTP_POST, handleButton);
+    server.on("/register", HTTP_GET, handleRegister);
     server.onNotFound([]() {
       Serial.printf("Unhandled request: %s\n", server.uri().c_str());
       server.send(404, "text/plain", "Not Found");
@@ -1080,4 +1215,9 @@ void loop() {
     }
     String line;
     while (getResp(line, 0, 0));
+    if (needButtonInfo) {
+      needButtonInfo = false;
+      Serial.println("broadcast: " + buttonInfo);
+      webSocket.broadcastTXT(buttonInfo);  // Send update to all connected clients (includes ourself)
+    }  
 }
