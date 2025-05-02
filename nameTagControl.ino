@@ -47,6 +47,7 @@ const uint16_t grbl_port = 23;
 String grblHttp;
 String buttonInfo;
 bool needButtonInfo = false;
+float xMpos, yMpos, zMpos;
 
 class TelnetStream : public Stream {
   public:
@@ -152,9 +153,16 @@ void startCamera() {
         Serial.println("failed to get the sensor");
 }
 void handleRoot() {
+    StaticJsonDocument<200> doc; // Adjust size based on your JSON complexity
     String buttonValues;
     // buttons set to default
     if (buttonInfo == "") {
+      // make default obj
+      doc["capture"] = true;
+      doc["light"] = false;
+      doc["qrcode"] = false;
+      doc["map"] = false;
+      doc["pos"] = false;
       buttonValues = "\n\
         let captureOn = true;\n\
         let lightOn = false;\n\
@@ -162,7 +170,6 @@ void handleRoot() {
         let isMapping = false;\n\
         let posOn = false;";
     } else {
-        StaticJsonDocument<200> doc; // Adjust size based on your JSON complexity
         DeserializationError error = deserializeJson(doc, buttonInfo);
         if (error) {
             Serial.print("deserializeJson() failed: ");
@@ -472,6 +479,8 @@ void handleRoot() {
     server.send(200, "text/html", html);
     if (buttonInfo == "") {
       digitalWrite(LED_GPIO, LOW); // Turn LED OFF
+      serializeJson(doc, buttonInfo);
+      Serial.println("default buttons: "  + buttonInfo);
     } else {
       needButtonInfo = true;
       Serial.println("needButtonInfo set to true");
@@ -521,8 +530,104 @@ bool sendRequest(String &url, JsonDocument &doc, int maxTry = 3) {
   return false;
 }
 
-bool sendCmd(String cmd, int wait4IdleMs = 0);
-String getState();
+String getState() {
+  if (!grblClient.connected() && grblClient.connect(grblIp.c_str(), grbl_port))
+    Serial.println("getState: Connected to GRBL via Telnet");
+
+  String state = "NA";
+  String line;
+  if (grblClient.connected()) {
+    // cleanup leftover in the queue
+    while (grblClient.available()) {
+      line = grblClient.readStringUntil('\n');
+#ifdef DEBUG
+      Serial.println("before getState: " + line);
+#endif
+      if (line.substring(0, 5) == "<Idle") 
+        return "Idle";
+    }
+    String cmd = "?";
+#ifdef DEBUG
+    Serial.println("getState: sending " + cmd);
+#endif
+    grblClient.println(cmd);
+    delay(200);
+    unsigned long now = millis();
+    while (!grblClient.available() && millis() - now < 1000) {
+      delay(50);
+    }
+    while (grblClient.available()) {
+      line = grblClient.readStringUntil('\n');
+#ifdef DEBUG
+      Serial.println ("getState: " + line);
+#endif
+      if (line.substring(0, 5) == "ALARM") {
+        return ("Alarm");
+        break;
+      }
+      if (line.charAt(0) == '<') {
+        // Extract state (between '<' and first '|')
+        int startIdx = 1;
+        int endIdx = line.indexOf('|');
+        if (endIdx > 1) {
+          state = line.substring(startIdx, endIdx);
+          //Serial.println ("state=" + state);
+          // get the current mpos
+          const char* cstr = line.c_str();
+          const char* mposPtr = strstr(cstr, "MPos:");
+          if (mposPtr) {
+            mposPtr += 5;  // Skip "MPos:"
+            if (sscanf(mposPtr, "%f,%f,%f", &xMpos, &yMpos, &zMpos) == 3) {
+              //Serial.printf("X=%.3f, Y=%.3f, Z=%.3f\n", xMpos, yMpos, zMpos);
+            } else {
+              Serial.println("Failed to parse MPos values");
+            }
+          } else {
+              Serial.println("MPos not found");
+          }
+        }
+      }
+    }
+  }
+  //Serial.println ("return=" + state);
+  return state;
+}
+
+bool sendCmd(String cmd, int ms = 100) {
+  bool wait4Idle(int ms);
+  bool getResp(String &lines, int ms);
+
+  uint32_t start = millis();
+  bool rv = false;
+  if (!grblClient.connected() && grblClient.connect(grblIp.c_str(), grbl_port)) {
+    delay(200);
+    Serial.println("sendCmd: Connecting to GRBL via Telnet");
+  }
+
+  if (grblClient.connected()) {
+    // cleanup leftover in the queue
+    String line;
+    while (grblClient.available()) {
+      line = grblClient.readStringUntil('\n');
+#ifdef DEBUG
+      Serial.println("before sendCmd: " + line);
+#endif
+    }
+#ifdef DEBUG
+    Serial.println("sendCmd: " + cmd);
+#endif
+    grblClient.println(cmd);
+    delay(200);
+    rv = getResp(line, ms);
+    // wait for idle state (if see the Idle already, don't need to wait)
+    if (line.indexOf("Idle") == -1 && ms > 0 && grblClient.connected()) {
+      rv = wait4Idle(ms);
+    }
+    Serial.printf("sendCmd: %s=%d, elape %d msec\n", cmd.c_str(), rv, millis() - start);
+  } else
+    Serial.println("failed to connect for cmd=" + cmd);
+  return rv;
+}
 
 bool wait4Idle(int msec = 1000) {
   if (!grblStatus)
@@ -530,8 +635,8 @@ bool wait4Idle(int msec = 1000) {
   // wait for idle state
   bool rv = false;
   if (msec > 0 && grblClient.connected()) {
-    unsigned long now = millis();
-    while (millis() - now < msec) {
+    unsigned long start = millis();
+    while (millis() - start < msec) {
       String state = getState();
       if (state == "Idle")
         return true;
@@ -539,7 +644,7 @@ bool wait4Idle(int msec = 1000) {
         Serial.println("Alarm: send $X to unlock");
         return sendCmd("$X");
       }
-      delay(100);
+      delay(500);
     }
     if (getState() == "Idle")
       return true;
@@ -547,90 +652,34 @@ bool wait4Idle(int msec = 1000) {
   return rv;
 }
 
-bool getResp(String &line, int timeout = 0, int wait4IdleMs = 0) {
+bool getResp(String &lines, int ms = 100) {
   bool rv = false;
-  if (timeout > 0) {
-    unsigned long now = millis();
-    while (millis() - now < timeout && !grblClient.available()) {
+  if (ms > 0) {
+    uint32_t end = millis() + ms;
+    // wait for any response
+    while (millis() < end && !grblClient.available()) {
       delay(10);
     }
   }
-
   bool alarm = false;
-  String lines;
+  String line;
+  lines = "";
   while (grblClient.available()) {
     line = grblClient.readStringUntil('\n');
+#ifdef DEBUG
+    Serial.println("getResp: " + line);
+#endif
     lines += line;
     if (line.substring(0, 5) == "ALARM" || line.substring(0, 6) == "<Alarm") {
       Serial.println("got ALARM: " + line + ", will send $X to unlock");
       alarm = true;
-    } else {
+    } else if (line.substring(0, 2) == "ok") {
       rv = true;
     }
   }
-  //if (rv)
-    //Serial.println("getResp: wait4Idle=" + String(wait4IdleMs) + ", " + lines);
   if (alarm)
     return sendCmd("$X");
-  // wait for idle state
-  if (wait4IdleMs > 0 && grblClient.connected()) {
-    rv = wait4Idle(wait4IdleMs);
-  }
   return rv;
-}
-
-bool sendCmd(String cmd, int wait4IdleMs) {
-  bool rv = false;
-  if (!grblClient.connected() && grblClient.connect(grblIp.c_str(), grbl_port)) {
-    delay(100);
-    Serial.println("sendCmd: Connecting to GRBL via Telnet");
-  }
-
-  if (grblClient.connected()) {
-    // cleanup leftover in the queue
-    String line;
-    while (getResp(line, 0, 0));
-    Serial.println("sendCmd: " + cmd);
-    grblClient.println(cmd);
-    rv = getResp(line, 500, wait4IdleMs);
-  } else
-    Serial.println("failed to connect for cmd=" + cmd);
-  return rv;
-}
-
-String getState() {
-  if (!grblClient.connected() && grblClient.connect(grblIp.c_str(), grbl_port))
-    Serial.println("getState: Connected to GRBL via Telnet");
-
-  String state = "NA";
-  if (grblClient.connected()) {
-    // cleanup leftover in the queue
-    String line;
-    while (getResp(line, 0, 0));
-    String cmd = "?";
-    //Serial.println("getState: sending " + cmd);
-    grblClient.println(cmd);
-
-    unsigned long now = millis();
-    while (millis() - now < 300 && !grblClient.available()) {
-      delay(200);
-    }
-    while (grblClient.available()) {
-      line = grblClient.readStringUntil('\n');
-      if (line.substring(0, 5) == "ALARM") {
-        Serial.println(line);
-        state = "Alarm";
-      }
-      if (line.charAt(0) == '<') {
-        int end = line.indexOf('|');
-        if (end > 1) {
-          state = line.substring(1, end);
-          //Serial.println ("state=" + state);
-        }
-      }
-    }
-  }
-  return state;
 }
 
 void registerController() {
@@ -785,19 +834,21 @@ bool getUidFromQR(int &uid, String &msg) {
 bool moveArm(int steps) {
   if (!grblStatus)
     return false;
-  return sendCmd("G90G0Y" + String(steps));
+  return sendCmd("G90G0Y" + String(steps), 3000);
 }
 
 bool moveWheel(int pos) {
   if (!grblStatus)
     return false;
-  return sendCmd("G99X" + String(pos), 5000);
+  return sendCmd("G99X" + String(pos), 12000);
 }
 
 bool clamp(bool on) {
   if (!grblStatus)
     return false;
-  return sendCmd(on ? "M3S500" : "M5", 1000);
+  sendCmd(on ? "M3S500" : "M5", 0);
+  delay(300);
+  return true;
 }
 
 int totSlot;
@@ -806,6 +857,7 @@ volatile bool stopMapping = false;
 int mapIndex = 0;
 int mapStep = 0;
 unsigned long mapStartTime;
+bool autoLight(bool chgLightFirst = false);
 
 bool initMapProcess() {
   String url;
@@ -835,6 +887,7 @@ bool initMapProcess() {
     mapIndex = 0;
     mapStep = 0;
     Serial.printf("initMapProcess: totSlot=%d\n", totSlot);
+    autoLight();
     return true;
   }
   Serial.println("grblId not set");
@@ -851,8 +904,11 @@ bool processMapping() {
       if (mapIndex == 0)
         mapStartTime = start;
       uid = -1;
+      if (yMpos > (float)Y_SCAN)
+        rv = moveArm(Y_SCAN);
+      else
+        rv = true;
       Serial.printf("start to process nametag map at position %d\n", mapIndex);
-      rv = moveArm(Y_SCAN);
       break;
     case 1:
       // move to position mapIndex
@@ -881,8 +937,10 @@ bool processMapping() {
       String msg;
       int cnt = 0;
       while (!getUidFromQR(uid, msg)) {
-        if (cnt++ > 3)
-          break;
+        if (cnt++ > 3) {
+          if (!autoLight(true))
+            break;
+        }
         Serial.println(msg);
         yield(); // Allow WiFi and HTTP handling
       }
@@ -965,20 +1023,26 @@ void handleStopMap() {
 }
 
 bool getNametag(int pos) {
-  bool rv =
-    // move Y to half way (SCAN) to get ready
-    moveArm(Y_SCAN) &&
-    // move to position
-    moveWheel(pos) &&
-    // move Y axis to grap position
-    moveArm(Y_GRAP) &&
-    // clamp the nametag
-    clamp(true) &&
-    // move Y axis to beginning position
-    moveArm(Y_BEGIN) &&
-    // drop the nametag
-    clamp(false);
+ uint32_t start = millis();
+  clamp(false);
+  // if current Y is over SCAN location, move Y to half way (SCAN) to let the wheel to turn
+  if (yMpos > (float)Y_SCAN)
+    moveArm(Y_SCAN);
+  // move to position
+  moveWheel(pos);
+  // move Y axis to grap position
+  moveArm(Y_GRAP);
+  // clamp the nametag
+  clamp(true);
+  delay(200);
+  // move Y axis to beginning position
+  moveArm(Y_BEGIN);
+  // drop the nametag
+  clamp(false);
+  delay(100);
+  bool rv = grblClient.connected();
   grblClient.stop();
+  Serial.printf("getNametag: elape %d msec\n", millis() - start);
   return rv;
 }
 
@@ -989,22 +1053,70 @@ bool initGrbl() {
   moveArm(Y_BEGIN);
   moveWheel(0);
   clamp(false);
+  bool rv = grblClient.connected();
   grblClient.stop();
-  return true;
+  return rv;
 }
 
-void handlgetNametag() {
+bool autoLight(bool chgLightFirst) {
+  String msg;
+  int uid = -1;
+  if (yMpos > (float)Y_SCAN)
+    moveArm(Y_SCAN);
+  wait4Idle(2000);
+  StaticJsonDocument<200> doc;
+  DeserializationError error = deserializeJson(doc, buttonInfo);
+  if (error) {
+      Serial.printf("autoLight(): deserializeJson() %s failed %s\n", buttonInfo.c_str(), error.c_str());
+      return false;
+  }
+  int cnt = 0;
+  bool lightOn = doc["light"].as<bool>();
+  if (chgLightFirst) {
+    lightOn = !lightOn;
+    digitalWrite(LED_GPIO, lightOn ? HIGH : LOW); // change the light and try
+    doc["light"] = lightOn;
+  }
+  while(cnt++ < 4) {
+    if (getUidFromQR(uid, msg) && uid == -1) {
+      Serial.printf("autoLight done, %s, light is %s\n", msg.c_str(), lightOn ? "ON" : "OFF");
+      if (cnt > 1) {
+        serializeJson(doc, buttonInfo);
+        Serial.println("new buttons: " + buttonInfo);
+        needButtonInfo = true;
+      }
+      return true;
+    }
+    lightOn = !lightOn;
+    digitalWrite(LED_GPIO, lightOn ? HIGH : LOW); // change the light and try
+    doc["light"] = lightOn;
+  }
+  return false;
+}
+
+void handleGetNametag() {
   if (server.hasArg("uid")) {
     String uid = server.arg("uid");
-    Serial.printf("handlgetNametag(): %s\n", uid.c_str());
-    int pos;
+    Serial.println("handleGetNametag(): uid=" + uid);
+    int pos = -1;
     // get the position first
     StaticJsonDocument<32> doc;
     String url = data_server + controlProcess + "?action=lookup&uid=" + uid;
     Serial.println(url);
     if (sendRequest(url, doc) && doc["success"].as<int>() == 1) {
-      pos = doc["id"].as<int>();
-      Serial.printf("found position %d for uid %s\n", pos, uid.c_str());
+      // found on the other nametag controllor, forward the request
+      if (doc["control_id"].as<int>() != control_id) {
+        String ip = doc["ip"].as<String>();
+        Serial.println("handlGetNameTag(): redirect to " + ip);
+        url = ip + "/getNametag?uid=" + uid;
+        if (sendRequest(url, doc) && doc["success"].as<int>() == 1) {
+          server.send(200, "text/plain", "Got nametag for " + uid + " at " + ip);
+          return;
+        }
+      } else {
+        pos = doc["pos"].as<int>();
+        Serial.printf("found position %d for uid %s\n", pos, uid.c_str());
+      }
     } else {
       Serial.printf("uid %s not found\n", uid.c_str());
       String msg = doc["msg"].as<String>();
@@ -1012,10 +1124,10 @@ void handlgetNametag() {
       server.send(500, "text/plain", msg);
       return;
     }
-    if (grbl_id == -1 || !getNametag(pos)) {
-        server.send(500, "text/plain", "Failed to get nametag for " + String(uid));
+    if (grbl_id == -1 || pos == -1 || !getNametag(pos)) {
+        server.send(500, "text/plain", "Failed to get nametag for " + uid);
     } else {
-        server.send(200, "text/plain", "Got nametag for " + String(uid));
+        server.send(200, "text/plain", "Got nametag for " + uid + " at " + String(pos));
     }
   } else {
     server.send(500, "text/plain", "Missing argument");
@@ -1151,6 +1263,7 @@ void setup() {
         Serial.println("End Failed");
       }
     });
+    ArduinoOTA.setHostname("nametag");
     ArduinoOTA.begin();
     Serial.println("OTA Ready");
 
@@ -1165,7 +1278,7 @@ void setup() {
     server.on("/processQR", HTTP_GET, handleProcessQR);
     server.on("/setNametagMap", HTTP_GET, handlesetupNametagMap);
     server.on("/stopMap", HTTP_GET, handleStopMap);
-    server.on("/getNametag", HTTP_GET, handlgetNametag);
+    server.on("/getNametag", HTTP_GET, handleGetNametag);
     server.on("/lighton", HTTP_GET, handleLightOn);
     server.on("/lightoff", HTTP_GET, handleLightOff);
     server.on("/homePos", HTTP_GET, handleHomePos);
@@ -1219,10 +1332,10 @@ void loop() {
       sendHeartbeat();
     }
     String line;
-    while (getResp(line, 0, 0));
+    while (getResp(line, 0));
     if (needButtonInfo) {
       needButtonInfo = false;
-      Serial.println("broadcast: " + buttonInfo);
+      Serial.println("needButtonInfo/broadcast: " + buttonInfo);
       webSocket.broadcastTXT(buttonInfo);  // Send update to all connected clients (includes ourself)
     }  
 }
